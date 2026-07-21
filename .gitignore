@@ -9,3 +9,13 @@ venv/
 # PDFs de trabajo (no versionar los documentos reales)
 data/pdfs/*
 !data/pdfs/.gitkeep
+
+# Inventario XLSX (no versionar el archivo real)
+data/inventario/*
+!data/inventario/.gitkeep
+
+# Notas de contexto del proyecto (uso interno, no se sube al repo)
+Claude.MD
+
+# Configuración local del IDE / Claude Code (no versionar)
+.claude/
