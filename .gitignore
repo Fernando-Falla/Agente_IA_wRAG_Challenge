@@ -17,5 +17,10 @@ data/inventario/*
 # Notas de contexto del proyecto (uso interno, no se sube al repo)
 Claude.MD
 
-# Configuración local del IDE / Claude Code (no versionar)
+# Configuración local del IDE / Claude Code (no versionar; rutas de interprete
+# especificas de esta maquina)
 .claude/
+.vscode/
+
+# Vector store generado (se reconstruye con app/ingest.py, no se versiona)
+data/chroma_db/
