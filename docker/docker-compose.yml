@@ -1,0 +1,63 @@
+# Despliegue de punta a punta en 1 sola VM Ampere A1 (Always Free, 2 OCPU/12GB):
+# Ollama (LLM + embeddings) + API (FastAPI) + interfaz (Streamlit).
+#
+# Primer arranque:
+#   docker compose up -d --build
+#   docker compose exec app python -m app.ingest      # puebla el vector store
+#
+# El pull de los modelos (gemma2:2b, bge-m3) lo hace automaticamente el
+# servicio "ollama-init" contra el servidor "ollama" antes de que arranquen
+# app/ui (ver docs/deploy.md para la guia completa).
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["sh", "-c", "ollama pull gemma2:2b && ollama pull bge-m3"]
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=gemma2:2b
+      - OLLAMA_EMBEDDING_MODEL=bge-m3
+      - CHROMA_PERSIST_DIR=/app/data/chroma_db
+      - CHUNK_SIZE=1200
+      - CHUNK_OVERLAP=200
+    volumes:
+      - ../data:/app/data:z
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      - API_BASE_URL=http://app:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

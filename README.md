@@ -41,6 +41,15 @@ Inventario XLSX (data/inventario/) ──► pandas ──► consulta estructur
 
 Ambos devuelven `{"respuesta": str}`.
 
+### Despliegue (Docker Compose)
+
+4 contenedores en una sola VM (ver [`docker/docker-compose.yml`](docker/docker-compose.yml) y la guía completa en [`docs/deploy.md`](docs/deploy.md)):
+
+- `ollama` — servidor Ollama (LLM + embeddings), modelos persistidos en volumen.
+- `ollama-init` — corre una vez al iniciar, descarga `gemma2:2b` y `bge-m3`, y termina.
+- `app` — API FastAPI (`/chat/documentos`, `/chat/inventario`), con `data/` montado como volumen (PDFs, XLSX y el vector store Chroma).
+- `ui` — interfaz Streamlit, expuesta públicamente en el puerto 8501.
+
 ### Decisiones técnicas relevantes
 
 **Modelo de embeddings: `bge-m3` en vez de `nomic-embed-text`.**
@@ -58,6 +67,9 @@ Al probar la UI de Streamlit del Bloque 3 aparecieron tres respuestas problemát
 
 Se aplicaron tres mitigaciones: `CHUNK_SIZE` 800→1200 y `CHUNK_OVERLAP` 150→200 (mantiene juntas secciones/listas compactas como la de categorías de proveedores), `k` del retriever 4→6, y un system prompt más explícito sobre ignorar contexto irrelevante y prestar cuidado a filas/columnas de tablas. Al reingestar y volver a probar las 3 preguntas más las 6 ya validadas del Bloque 2 (sin regresiones), el caso de proveedores y el de robo quedaron corregidos. El caso de las 3 faltas **persiste**: `PyPDFLoader` extrae las tablas del PDF como texto corrido sin estructura de filas/columnas, y un modelo de 2B parámetros tiene dificultad real para asociar correctamente la fila y columna que corresponden — ni el prompt ni más contexto lo resuelven. Se documenta como limitación conocida (ver `docs/bitacora-tecnica.md`) y se retiró esa pregunta del panel de sugerencias del Bloque 3, dejando en su lugar la de "acta administrativa" (misma categoría de Gestión de Personal, validada de forma consistente).
 
+**Se mantiene OCI (1 VM consolidada, Pay-As-You-Go) en vez de migrar a Streamlit Cloud/AWS.**
+A mitad del Bloque 3, la cuenta OCI Free Tier recibió aviso de suspensión de su período de prueba. Se evaluó migrar a Streamlit Community Cloud y/o recursos gratuitos de AWS, pero ambas alternativas resultaron más limitadas de lo esperado para este proyecto: AWS Free Tier ya no ofrece EC2 permanente (solo 12 meses, 1 GB RAM, y solo para cuentas creadas antes de julio de 2025); Streamlit Community Cloud tiene 1 GB RAM y no soporta correr Ollama. Se decidió mantenerse en OCI: consolidar las 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free) y cambiar la cuenta a Pay-As-You-Go para evitar la suspensión del trial, permaneciendo dentro de los límites Always Free para no generar cargos. La VM corre Oracle Linux 9, lo que suma dos capas de firewall a considerar además de la Security List de OCI: `firewalld` (activo por defecto) y SELinux (requiere la bandera `:z` en el volumen de `data/` montado en Docker — ver `docker/docker-compose.yml`). Detalle completo en `docs/bitacora-tecnica.md` y `docs/deploy.md`.
+
 ## Stack
 
 - **Lenguaje:** Python
@@ -66,7 +78,9 @@ Se aplicaron tres mitigaciones: `CHUNK_SIZE` 800→1200 y `CHUNK_OVERLAP` 150→
 - **Embeddings:** bge-m3 (vía Ollama)
 - **Vector store:** Chroma
 - **LLM:** Gemma (vía Ollama), dockerizado
-- **Deploy:** Docker + OCI Compute (Always Free Ampere A1)
+- **API del agente:** FastAPI + uvicorn
+- **Interfaz UX/UI:** Streamlit ("Centy") — chat con panel lateral de sugerencias
+- **Deploy:** Docker Compose (Ollama + API + UI) en 1 VM Ampere A1 Always Free (OCI, Oracle Linux 9)
 
 ## Ejemplos de preguntas y respuestas
 
@@ -94,7 +108,36 @@ Validado localmente contra `/chat/inventario` (consulta estructurada, sin LLM):
 
 ## Cómo ejecutar el proyecto
 
-_(Instrucciones pendientes — local y en la nube)_
+### Local (desarrollo)
+
+Requiere Python 3.11 (entorno conda/venv propio) y [Ollama](https://ollama.com) instalado, con los modelos descargados:
+
+```bash
+ollama pull gemma2:2b
+ollama pull bge-m3
+pip install -r requirements.txt
+cp .env.example .env
+
+python -m app.ingest          # construye el vector store (una vez, o cuando cambien los PDFs)
+
+# Terminal 1 — API
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 — interfaz
+streamlit run ui/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+Abrir `http://127.0.0.1:8501`.
+
+### En la nube (OCI, producción)
+
+Todo el stack (Ollama + API + interfaz) corre dockerizado en una sola VM Ampere A1 Always Free. Ver la guía completa, con todos los comandos, en [`docs/deploy.md`](docs/deploy.md):
+
+```bash
+cd docker
+docker compose up -d --build
+docker compose exec app python -m app.ingest
+```
 
 ## Evidencia del deploy
 

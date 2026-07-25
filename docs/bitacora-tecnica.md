@@ -80,3 +80,18 @@ Se reingestó el vector store (302 chunks, antes 433) y se volvieron a probar lo
 - Las 6 preguntas previamente validadas del Bloque 2 se mantuvieron correctas — sin regresiones.
 
 **Limitación conocida que persiste.** La extracción de tablas de `PyPDFLoader` pierde la estructura de filas/columnas del PDF original. Un modelo de 2B parámetros puede tener dificultad para interpretar correctamente una tabla aplanada a texto, especialmente cuando debe distinguir entre columnas semánticamente parecidas (Primera Vez vs. Reincidencia). Una solución más robusta —reformatear las tablas explícitamente durante la ingesta usando una librería con detección de tablas (p. ej. `unstructured` o `pdfplumber`)— queda fuera de alcance por ahora y se documenta aquí como limitación conocida y candidata a un trabajo futuro, dado el compromiso del proyecto con modelos pequeños y cuantizados por la restricción de recursos de OCI. Como consecuencia práctica, se retiró la pregunta de las 3 faltas del panel de sugerencias de la interfaz (Bloque 3), dejando en su lugar la de "acta administrativa" (misma categoría de Gestión de Personal, validada de forma consistente).
+
+---
+
+## Bloque 4 — Docker / Deploy
+
+**Confirmación de infraestructura.** Fernando confirmó la consolidación de las 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free), cuenta en modo Pay-As-You-Go, y que el sistema operativo de la VM es **Oracle Linux 9** (no Ubuntu, que era la suposición inicial más común). Esto cambió los comandos de instalación de Docker (`dnf` en vez de `apt`) y añadió dos consideraciones que no aplicarían en Ubuntu:
+
+- **`firewalld`**, activo por defecto en Oracle Linux, bloquea el puerto 8501 además de la Security List/NSG de la VCN — hay que abrirlo en ambas capas.
+- **SELinux**, activo por defecto (enforcing), puede bloquear el bind mount de `data/` hacia el contenedor `app` si no se etiqueta correctamente. Se agregó la bandera `:z` al volumen en `docker/docker-compose.yml` (`../data:/app/data:z`) para que Docker relabele automáticamente el directorio.
+
+**Arquitectura de despliegue: 4 servicios en un solo `docker-compose.yml`.** `ollama` (servidor, modelos en volumen nombrado), `ollama-init` (contenedor de una sola pasada que hace `ollama pull gemma2:2b` y `ollama pull bge-m3` contra el servidor, vía `OLLAMA_HOST`, y termina), `app` (FastAPI, con `data/` — PDFs, XLSX y el vector store Chroma — montado como volumen desde el host) y `ui` (Streamlit, expuesto públicamente en el 8501). El build de la imagen se hace en la propia VM (ARM64/aarch64), no de forma cruzada desde Windows.
+
+**No se pudo probar el build/arranque de Docker en esta máquina** (no hay Docker instalado localmente en el entorno de desarrollo de Fernando) — se validó la sintaxis del `docker-compose.yml` con un parser YAML, pero la prueba real de extremo a extremo (build, `ollama-init`, ingesta, acceso público) queda pendiente de ejecutar en la VM.
+
+**Próximo paso acordado:** una vez arriba y funcionando en OCI, monitorear consumo real de recursos (`docker stats`, `free -h`) antes de decidir si hay margen para agregar un reranking con cross-encoder pequeño.
