@@ -66,10 +66,17 @@ Tras la verificación visual, Fernando probó las preguntas sugeridas del panel 
 
 ## Cambios decididos a partir de estos hallazgos
 
-Aplicados en el commit posterior a esta bitácora:
-
 - **`CHUNK_SIZE` de 800 a 1200 caracteres** (`CHUNK_OVERLAP` de 150 a 200), para reducir la fragmentación de secciones/listas compactas como la de categorías de proveedores.
 - **`k` del retriever de 4 a 6**, para mejorar el recall general.
 - **Endurecimiento del system prompt**: instrucción explícita de ignorar fragmentos de contexto irrelevantes para la pregunta, no mezclar procedimientos de secciones o documentos distintos, y prestar especial cuidado al leer tablas con múltiples columnas.
 
-**Limitación conocida que persiste.** La extracción de tablas de `PyPDFLoader` pierde la estructura de filas/columnas del PDF original. Incluso con las mitigaciones anteriores, un modelo de 2B parámetros puede tener dificultad ocasional para interpretar correctamente una tabla aplanada a texto (caso 1). Una solución más robusta —reformatear las tablas explícitamente durante la ingesta usando una librería con detección de tablas (p. ej. `unstructured` o `pdfplumber`)— queda fuera de alcance por ahora y se documenta aquí como limitación conocida y candidata a un trabajo futuro, dado el compromiso del proyecto con modelos pequeños y cuantizados por la restricción de recursos de OCI.
+## Resultado tras aplicar los cambios
+
+Se reingestó el vector store (302 chunks, antes 433) y se volvieron a probar los 3 casos reportados más las 6 preguntas ya validadas del Bloque 2, para descartar regresiones.
+
+- **Caso proveedores (Categoría B faltante): corregido.** La respuesta ahora incluye las 3 categorías completas.
+- **Caso robo ("aislar el producto"): corregido.** La respuesta ya no mezcla el protocolo de robo con el de producto dañado; es coherente con el reglamento.
+- **Caso de las 3 faltas: persiste.** El agente sigue respondiendo la sanción de *Reincidencia* en vez de *Primera Vez*, a pesar de que el chunk recuperado contiene la tabla completa y correcta, y a pesar del prompt endurecido. Se confirma que es una limitación de lectura de tablas del modelo (no de recuperación) que estas mitigaciones no alcanzan a resolver.
+- Las 6 preguntas previamente validadas del Bloque 2 se mantuvieron correctas — sin regresiones.
+
+**Limitación conocida que persiste.** La extracción de tablas de `PyPDFLoader` pierde la estructura de filas/columnas del PDF original. Un modelo de 2B parámetros puede tener dificultad para interpretar correctamente una tabla aplanada a texto, especialmente cuando debe distinguir entre columnas semánticamente parecidas (Primera Vez vs. Reincidencia). Una solución más robusta —reformatear las tablas explícitamente durante la ingesta usando una librería con detección de tablas (p. ej. `unstructured` o `pdfplumber`)— queda fuera de alcance por ahora y se documenta aquí como limitación conocida y candidata a un trabajo futuro, dado el compromiso del proyecto con modelos pequeños y cuantizados por la restricción de recursos de OCI. Como consecuencia práctica, se retiró la pregunta de las 3 faltas del panel de sugerencias de la interfaz (Bloque 3), dejando en su lugar la de "acta administrativa" (misma categoría de Gestión de Personal, validada de forma consistente).

@@ -9,3 +9,5 @@ openpyxl
 python-dotenv
 fastapi
 uvicorn
+streamlit
+requests
