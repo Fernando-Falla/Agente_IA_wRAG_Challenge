@@ -95,3 +95,66 @@ Se reingestó el vector store (302 chunks, antes 433) y se volvieron a probar lo
 **No se pudo probar el build/arranque de Docker en esta máquina** (no hay Docker instalado localmente en el entorno de desarrollo de Fernando) — se validó la sintaxis del `docker-compose.yml` con un parser YAML, pero la prueba real de extremo a extremo (build, `ollama-init`, ingesta, acceso público) queda pendiente de ejecutar en la VM.
 
 **Próximo paso acordado:** una vez arriba y funcionando en OCI, monitorear consumo real de recursos (`docker stats`, `free -h`) antes de decidir si hay margen para agregar un reranking con cross-encoder pequeño.
+
+---
+
+## Bloque 4 — Continuación: despliegue real en OCI
+
+**Transferencia de archivos sin scp/ssh directo.** Fernando no logra usar `scp` desde su máquina local; su flujo de trabajo real es la consola web de OCI + el bucket de Object Storage ("el cubo") + **OCI Cloud Shell**, desde donde sí puede hacer `ssh opc@<IP>` hacia la VM (confirmado con el prompt `[opc@dps-vm1 ~]$`). La transferencia de los 4 PDFs y el XLSX se resolvió generando **Pre-Authenticated Requests (PAR)** para cada objeto del bucket desde la consola, y descargándolos directamente en la VM con `wget -O "<ruta_destino>" "<URL_PAR>"` — sin necesidad de `scp`, CLI local de OCI, ni credenciales adicionales en la VM.
+
+**Instalación de Docker en Oracle Linux 9:** exitosa con la secuencia `dnf install -y dnf-utils` → `dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo` → `dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`. Versión instalada: Docker 29.6.2 / Compose v5.3.1.
+
+**`docker compose up -d --build` exitoso:** las 2 imágenes (`docker-app`, `docker-ui`) se construyeron en ~203s cada una; el pull de `ollama/ollama:latest` tomó ~579s; `ollama-init` (descarga de `gemma2:2b` + `bge-m3`) tomó ~489s. Los 4 servicios quedaron arriba sin errores.
+
+**Ingesta ejecutada en la VM:** `docker compose exec app python -m app.ingest` produjo **302 chunks** — el mismo número exacto que en el entorno local con los mismos parámetros (`CHUNK_SIZE=1200`, `CHUNK_OVERLAP=200`), confirmando que los 4 PDFs subidos vía PAR llegaron completos y sin corrupción.
+
+### Troubleshooting: la app no era accesible desde internet
+
+Diagnóstico por descarte, de adentro hacia afuera:
+1. `docker compose ps` — contenedores `Up`, puertos publicados correctamente (`0.0.0.0:8501->8501/tcp`).
+2. `curl -I http://localhost:8501` desde la propia VM → `200 OK`. Esto confirmó que **la aplicación en sí funcionaba perfectamente**; el problema no era ni Docker ni Streamlit ni la API.
+3. `docker compose logs ui` confirmó "External URL: http://158.247.123.37:8501" — Streamlit detectaba bien su propia IP pública.
+4. `sudo firewall-cmd --list-ports` → `8501/tcp` ya estaba abierto.
+
+Con los 4 puntos anteriores en verde, la única capa que quedaba sin verificar era la de red de OCI (Security List o Network Security Group de la VCN) — que es **independiente de `firewalld`** y bloquea el tráfico *antes* de que llegue siquiera a la VM. Tras agregar la regla de ingreso correspondiente (TCP, puerto destino 8501, origen `0.0.0.0/0`) en la consola de OCI, la aplicación quedó accesible públicamente. Lección para `docs/deploy.md`: siempre son **dos capas de firewall independientes** a revisar (Security List/NSG + `firewalld`), y un fallo silencioso (timeout, no "connection refused") apunta casi siempre a la capa de red de la nube, no al sistema operativo.
+
+### Monitoreo de recursos
+
+**En reposo** (`docker stats --no-stream` y `free -h`, sin preguntas activas):
+
+| Contenedor | CPU | RAM |
+|---|---|---|
+| `ollama` | 0.00% | 88.7 MiB |
+| `app` | 0.07% | 136.5 MiB |
+| `ui` | 0.22% | 53.5 MiB |
+
+`free -h`: 10 GiB totales, 1.4 GiB usados, **9.3 GiB disponibles**, swap (4 GiB) sin usar. El `ollama` en 88.7 MiB confirma que, tras el timeout de inactividad (`keep_alive` por defecto de 5 min), ningún modelo queda cargado en memoria.
+
+**En el pico** (`docker stats --no-stream` repetido mientras Centy respondía una pregunta):
+
+| Contenedor | CPU | RAM |
+|---|---|---|
+| `ollama` | **~198%** (los 2 OCPU casi al 100% cada uno) | **~3.86 GiB** |
+| `app` | 0.10% | 137 MiB |
+| `ui` | ~0.3% | 54 MiB |
+
+**Conclusión clave:** en esta VM de 2 OCPU, **el CPU es el recurso limitante durante la generación, no la RAM**. Incluso en el pico, quedan ~5-6 GiB de RAM libres — pero ambos cores están saturados por Ollama mientras genera una respuesta. Esto reformula la pregunta original ("¿hay espacio para un reranker?"): en memoria sí, pero cualquier paso de cómputo adicional (como un reranker) se sumará en serie al tiempo de respuesta, porque no hay CPU ocioso que se solape con la generación.
+
+### Experimento: latencia de un reranker con cross-encoder (local, pendiente de validar en la VM)
+
+Se instaló `sentence-transformers` (trae PyTorch como dependencia — bastante más pesado que lo usado hasta ahora) y se probó `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (multilingüe, entrenado en mMARCO que incluye español, ~118 MB) en la máquina de desarrollo local (Windows), no en la VM.
+
+Metodología: para 4 preguntas de prueba, se comparó (a) baseline: `similarity_search(k=6)` + generación, contra (b) con reranking: `similarity_search(k=15)` → cross-encoder → top 6 → generación (mismo `k` final, para que la comparación de la etapa de generación sea justa).
+
+| Pregunta | Tiempo del paso de reranking |
+|---|---|
+| Clasificación de proveedores | 0.82s |
+| Robo | 0.73s |
+| Surtido nocturno | 0.86s |
+| Sismo | 0.90s |
+
+El tiempo total de extremo a extremo varió mucho entre corridas (de -23s a +5s de diferencia), pero **eso es ruido de la generación de Gemma** (su tiempo de generación por sí solo varió entre 36s y 55s en las mismas pruebas, con o sin reranking) — no un efecto del reranker. El dato limpio y consistente es el paso de reranking en sí: **entre 0.7 y 0.9 segundos**, muy por debajo del umbral de 3-5s que Fernando definió como aceptable.
+
+Como beneficio adicional no buscado: en 2 de las 4 preguntas (robo, sismo), la respuesta con reranking fue más completa y más fiel al documento que la respuesta base (incluyó pasos del procedimiento real que la respuesta base omitía).
+
+**Nota de precaución:** esta prueba corrió en Windows/x86_64 con recursos de sobra. La VM de producción es ARM64 y ya tiene el CPU saturado durante la generación (ver monitoreo arriba). El siguiente paso es repetir esta misma prueba directamente en la VM, de forma reversible (instalación efímera dentro del contenedor `app` en ejecución, sin modificar la imagen ni el `docker-compose.yml`, descartable con `docker compose restart app`), antes de decidir si se integra de forma permanente al pipeline de producción.

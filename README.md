@@ -2,6 +2,9 @@
 
 Agente de inteligencia artificial (RAG) que responde preguntas en lenguaje natural sobre documentos internos de una empresa (PDF), sin necesidad de abrirlos manualmente.
 
+> ### 🔗 Aplicación en producción: **http://158.247.123.37:8501**
+> Desplegada de punta a punta en una VM Ampere A1 Always Free (OCI). Ver detalle en [Evidencia del deploy](#evidencia-del-deploy).
+
 ## Arquitectura
 
 Pipeline del agente:
@@ -29,7 +32,7 @@ Inventario XLSX (data/inventario/) ──► pandas ──► consulta estructur
 - `app/inventory.py` — consultas estructuradas sobre el inventario (búsqueda por producto/categoría, stock bajo mínimo, próximos a vencer).
 - `app/chain.py` — cadena de recuperación + generación (RAG) sobre las políticas, usando Chroma como retriever y Gemma (vía Ollama) como generador.
 - `app/router.py` — dentro del modo inventario, decide qué función de `app/inventory.py` llamar (categoría, stock mínimo, vencimiento o búsqueda por texto) por coincidencia directa contra el propio catálogo.
-- `app/main.py` — API (FastAPI). Scaffold de pruebas locales por ahora; se formaliza en el Bloque 3-4.
+- `app/main.py` — API (FastAPI), en producción vía Docker Compose (ver Despliegue).
 
 ### Endpoints de la API
 
@@ -69,6 +72,12 @@ Se aplicaron tres mitigaciones: `CHUNK_SIZE` 800→1200 y `CHUNK_OVERLAP` 150→
 
 **Se mantiene OCI (1 VM consolidada, Pay-As-You-Go) en vez de migrar a Streamlit Cloud/AWS.**
 A mitad del Bloque 3, la cuenta OCI Free Tier recibió aviso de suspensión de su período de prueba. Se evaluó migrar a Streamlit Community Cloud y/o recursos gratuitos de AWS, pero ambas alternativas resultaron más limitadas de lo esperado para este proyecto: AWS Free Tier ya no ofrece EC2 permanente (solo 12 meses, 1 GB RAM, y solo para cuentas creadas antes de julio de 2025); Streamlit Community Cloud tiene 1 GB RAM y no soporta correr Ollama. Se decidió mantenerse en OCI: consolidar las 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free) y cambiar la cuenta a Pay-As-You-Go para evitar la suspensión del trial, permaneciendo dentro de los límites Always Free para no generar cargos. La VM corre Oracle Linux 9, lo que suma dos capas de firewall a considerar además de la Security List de OCI: `firewalld` (activo por defecto) y SELinux (requiere la bandera `:z` en el volumen de `data/` montado en Docker — ver `docker/docker-compose.yml`). Detalle completo en `docs/bitacora-tecnica.md` y `docs/deploy.md`.
+
+**Se acepta un tiempo de respuesta de 30-45 segundos a cambio de tener todo dockerizado y autoalojado.**
+Es una decisión consciente, no una limitación pasada por alto: se priorizó que Ollama, la API y la interfaz corran completos en una sola VM propia, sin ninguna llamada a servicios externos, para que los documentos internos de la empresa nunca salgan de la infraestructura controlada por Mercado Central 24h. El costo de esa decisión es velocidad — un modelo de 2B corriendo por CPU en 2 OCPU no es rápido. Con recursos de cómputo de pago en la nube (más OCPU, GPU) o con hardware local más potente, el tiempo de respuesta bajaría de forma significativa manteniendo exactamente la misma arquitectura y el mismo nivel de seguridad de los documentos — es una limitación de recursos del tier gratuito, no del diseño.
+
+**Evaluando reranking con cross-encoder (en curso, aún no en producción).**
+El monitoreo de recursos en el deploy real (ver Evidencia del deploy) mostró que sobra RAM pero el CPU se satura por completo durante la generación. Se probó localmente si un cross-encoder pequeño y multilingüe (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`, ~118 MB, vía `sentence-transformers`) sería viable: recuperar 15 candidatos por similitud, rerankearlos, y quedarse con los 6 mejores antes de generar. El paso de reranking en sí tomó consistentemente entre 0.7 y 0.9 segundos en 4 preguntas de prueba — muy por debajo del margen aceptable (3-5s) — y en 2 de los 4 casos la respuesta con reranking resultó más completa y fiel al documento que la respuesta base. Falta validar que ese mismo tiempo se sostenga en la VM de producción (ARM64, con el CPU ya al límite durante la generación) antes de decidir si se integra de forma permanente. Detalle completo en `docs/bitacora-tecnica.md`.
 
 ## Stack
 
@@ -141,4 +150,19 @@ docker compose exec app python -m app.ingest
 
 ## Evidencia del deploy
 
-_(Enlace o captura pendiente)_
+> ### 🔗 Aplicación en producción: **http://158.247.123.37:8501**
+
+Desplegada de punta a punta en una VM `VM.Standard.A1.Flex` (2 OCPU / 12 GB, Always Free), Oracle Linux 9, siguiendo la guía de [`docs/deploy.md`](docs/deploy.md).
+
+**Checklist verificado:**
+- [x] Docker + Compose instalados en la VM (`dnf`, ver `docs/deploy.md`).
+- [x] `docker compose up -d --build` — 4 servicios arriba (`ollama`, `ollama-init`, `app`, `ui`).
+- [x] Ingesta ejecutada en la VM: **302 chunks**, idéntico al conteo en local — confirma que los PDFs subidos vía Object Storage llegaron completos.
+- [x] Acceso público verificado desde el navegador.
+
+**Troubleshooting real durante el despliegue** (detalle completo en `docs/bitacora-tecnica.md`):
+- La app respondía bien probada desde dentro de la VM (`curl localhost:8501` → 200 OK) pero no era accesible desde internet. `firewalld` ya tenía el puerto abierto — la causa real fue la capa de red de OCI (Network Security Group / Security List), que necesita su propia regla de ingreso independiente de `firewalld`. Son dos capas de firewall distintas y ambas deben estar abiertas.
+
+**Monitoreo de recursos** (`docker stats`, `free -h`):
+- En reposo: `ollama` usa solo 88.7 MiB (sin modelos cargados en memoria); 9.3 GB de 10 GB disponibles; swap sin usar.
+- En el pico de una consulta activa: `ollama` sube a **~198% de CPU** (los 2 OCPU casi al 100% cada uno) y **~3.86 GB de RAM**. Esto confirma que **el CPU, no la RAM, es el recurso limitante** en esta VM — quedan ~5-6 GB de RAM libres incluso en el pico, lo que abre la puerta a evaluar el reranking con cross-encoder (ver Decisiones técnicas).
