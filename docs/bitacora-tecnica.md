@@ -30,21 +30,19 @@ Registro de hallazgos, pruebas y decisiones tomadas durante el desarrollo del pr
 
 ## Bloque 3 — Interfaz UX/UI
 
-**Decisión de infraestructura (imprevista).** A mitad del Bloque 3, Fernando fue notificado de que su cuenta OCI Free Tier sería suspendida el 30 de julio de 2026. Se evaluó como alternativa migrar a Streamlit Community Cloud y/o recursos gratuitos de AWS. Al revisar las limitaciones reales de esas alternativas (AWS Free Tier: solo 1 GB RAM y únicamente 12 meses para cuentas creadas después de julio de 2025, ya no permanente; Streamlit Community Cloud: 1 GB RAM, no soporta correr Ollama; Hugging Face Spaces: correr un Space con Docker requiere plan de pago), **Fernando decidió mantenerse en OCI**: consolidar sus 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free) y cambiar la cuenta a Pay-As-You-Go para evitar la suspensión del trial, permaneciendo dentro de los límites Always Free para no generar cargos. Esta decisión confirma sin cambios el plan original de despliegue del CLAUDE.md (una sola VM, un solo `docker-compose` con Ollama + app).
+**Decisión de infraestructura (imprevista).** A mitad del Bloque 3, Fernando fue notificado de que su cuenta OCI Free Tier sería suspendida el 30 de julio de 2026. Se evaluó como alternativa migrar a Streamlit Community Cloud y/o recursos gratuitos de AWS. Al revisar las limitaciones reales de esas alternativas (AWS Free Tier: solo 1 GB RAM y únicamente 12 meses para cuentas creadas después de julio de 2025, ya no permanente; Streamlit Community Cloud: 1 GB RAM, no soporta correr Ollama; Hugging Face Spaces: correr un Space con Docker requiere plan de pago), **Fernando decidió mantenerse en OCI**: consolidar sus 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free) y cambiar la cuenta a Pay-As-You-Go para evitar la suspensión del trial, permaneciendo dentro de los límites Always Free para no generar cargos. Esta decisión mantiene sin cambios el plan original de despliegue (una sola VM, un solo `docker-compose` con Ollama + app).
 
 **Decisión de framework de UI: Streamlit.** Se aclaró una confusión inicial: Streamlit (la librería) no depende de Streamlit Community Cloud (el servicio de hosting) — corre como un contenedor más en el mismo `docker-compose`, 100% autoalojado en la VM de OCI. Su huella de memoria (~100-200 MB) es marginal frente a los varios GB que usa Ollama+Gemma.
 
-**Nombre del asistente: Centy.** Definido por Fernando en este punto, según lo previsto por el CLAUDE.md.
+**Nombre del asistente: Centy.** Definido por Fernando en este punto.
 
-**Construcción de `ui/app.py`**: chat con panel lateral de sugerencias (recomendado fuertemente por el CLAUDE.md para usuarios no técnicos) y selector explícito de modo (Documentos / Inventario), consistente con la decisión de los dos endpoints separados.
-
-**Verificación visual.** Fernando probó la interfaz en el navegador y la calificó como "sobria y muy intuitiva".
+**Construcción de `ui/app.py`**: chat con panel lateral de sugerencias (pensado para usuarios no técnicos) y selector explícito de modo (Documentos / Inventario), consistente con la decisión de los dos endpoints separados.
 
 ---
 
 ## Hallazgos de calidad en las respuestas (pruebas de Fernando sobre el modo Documentos)
 
-Tras la verificación visual, Fernando probó las preguntas sugeridas del panel y reportó tres respuestas problemáticas. Cada una se investigó a fondo inspeccionando directamente los chunks recuperados por el vector store (no solo la respuesta final del LLM), para distinguir problemas de *recuperación* de problemas de *generación*.
+Tras construir la interfaz, Fernando probó las preguntas sugeridas del panel y reportó tres respuestas problemáticas. Cada una se investigó a fondo inspeccionando directamente los chunks recuperados por el vector store (no solo la respuesta final del LLM), para distinguir problemas de *recuperación* de problemas de *generación*.
 
 ### 1. "Un empleado ha faltado 3 veces sin justificación en el mes. ¿Qué sanción debo aplicar?"
 
@@ -157,4 +155,10 @@ El tiempo total de extremo a extremo varió mucho entre corridas (de -23s a +5s 
 
 Como beneficio adicional no buscado: en 2 de las 4 preguntas (robo, sismo), la respuesta con reranking fue más completa y más fiel al documento que la respuesta base (incluyó pasos del procedimiento real que la respuesta base omitía).
 
-**Nota de precaución:** esta prueba corrió en Windows/x86_64 con recursos de sobra. La VM de producción es ARM64 y ya tiene el CPU saturado durante la generación (ver monitoreo arriba). El siguiente paso es repetir esta misma prueba directamente en la VM, de forma reversible (instalación efímera dentro del contenedor `app` en ejecución, sin modificar la imagen ni el `docker-compose.yml`, descartable con `docker compose restart app`), antes de decidir si se integra de forma permanente al pipeline de producción.
+**Nota de precaución:** esta prueba corrió en Windows/x86_64 con recursos de sobra. La VM del deploy es ARM64 y ya tiene el CPU saturado durante la generación (ver monitoreo arriba). El siguiente paso es repetir esta misma prueba directamente en la VM, de forma reversible (instalación efímera dentro del contenedor `app` en ejecución, sin modificar la imagen ni el `docker-compose.yml`, descartable con `docker compose restart app`), antes de decidir si se integra de forma permanente al pipeline del deploy.
+
+---
+
+## Cierre del deploy
+
+El deploy en OCI estuvo activo desde julio hasta el **30 de agosto de 2026**. Después se canceló la cuenta de OCI y la aplicación quedó fuera de línea. Por eso **la prueba del reranker en la VM no se llegó a hacer** y el reranker no se integró al pipeline. La evidencia del deploy es la que queda en esta bitácora (instalación, ingesta de 302 chunks, troubleshooting de red y monitoreo con `docker stats`) y en el README.
