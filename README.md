@@ -1,99 +1,105 @@
-# Agente de IA para Documentos Internos
+# Agente de IA para Documentos Internos (RAG híbrido)
 
-Agente de inteligencia artificial (RAG) que responde preguntas en lenguaje natural sobre documentos internos de una empresa (PDF), sin necesidad de abrirlos manualmente.
+Agente de IA que responde preguntas en lenguaje natural sobre los documentos internos de una empresa (PDF) y sobre su inventario (XLSX), sin abrir los archivos a mano.
 
-> ### 🔗 Aplicación en producción: **http://158.247.123.37:8501**
-> Desplegada de punta a punta en una VM Ampere A1 Always Free (OCI). Ver detalle en [Evidencia del deploy](#evidencia-del-deploy).
+> **Contexto:** challenge académico. La empresa ("Mercado Central 24h"), sus PDF y su inventario son **material ficticio**.
+>
+> **Estado:** **desplegado en OCI (jul – 30-ago-2026)** en una VM Ampere A1 Always Free con Docker Compose. Hoy no hay demo en línea: la cuenta de OCI se cerró. La evidencia del deploy (ingesta, troubleshooting y monitoreo de recursos) está en [Evidencia del deploy](#evidencia-del-deploy) y en [`docs/bitacora-tecnica.md`](docs/bitacora-tecnica.md).
+
+## Qué demuestra este proyecto
+
+- **Arquitectura híbrida con criterio:** RAG para las políticas en PDF y consultas deterministas con pandas para el inventario. Las cifras de stock y precio no pasan por el LLM, porque `gemma2:2b` no ofrece un function calling confiable en Ollama y un modelo de 2B no debe improvisar números.
+- **Decisiones medidas, no intuitivas:** cambio de embeddings (`nomic-embed-text` → `bge-m3`) tras un diagnóstico con `similarity_search`; chunking de 800/150 → 1200/200 y `k` de 4 → 6, validados sin regresiones en un set de 6 preguntas.
+- **Deploy autoalojado de punta a punta:** 4 servicios en Docker Compose sobre Oracle Linux 9 (ARM64), con troubleshooting real de red (Security List de OCI + `firewalld`) y SELinux.
+- **Profiling antes de optimizar:** `docker stats` mostró que el cuello de botella es el CPU, no la RAM; eso orientó la evaluación de un reranker.
+- **Limitaciones documentadas con su causa raíz** (ver [Limitaciones conocidas](#limitaciones-conocidas)).
 
 ## Arquitectura
 
-Pipeline del agente:
-
 ```
-PDFs (data/pdfs/)  ──► PyPDFLoader ──► chunking (RecursiveCharacterTextSplitter,
-                                        800 caract. / 150 de solape)
-                                              │
-                                              ▼
-                                   Embeddings (Ollama: bge-m3)
-                                              │
-                                              ▼
-                                     Vector store (Chroma)
-                                              │
-Pregunta del usuario ──► retriever (top-k) ──┤
-                                              ▼
-                          Prompt + contexto recuperado ──► Gemma (Ollama) ──► Respuesta
+PDFs (data/pdfs/) ──► PyPDFLoader ──► chunking (RecursiveCharacterTextSplitter,
+                                       1200 caract. / 200 de overlap)
+                                             │
+                                             ▼
+                                  Embeddings (Ollama: bge-m3)
+                                             │
+                                             ▼
+                                    Vector store (Chroma)
+                                             │
+Pregunta (modo Documentos) ──► retriever (k=6) ──┤
+                                             ▼
+                      System prompt + contexto recuperado ──► gemma2:2b (Ollama) ──► Respuesta
 
-Inventario XLSX (data/inventario/) ──► pandas ──► consulta estructurada directa
-                                                    (no pasa por el vector store)
+Pregunta (modo Inventario) ──► router por función ──► pandas sobre el XLSX ──► Respuesta
+                                                      (no pasa por el vector store ni por el LLM)
 ```
 
-- `app/loaders.py` — carga de PDFs (`PyPDFLoader`) e inventario (`pandas.read_excel`).
-- `app/ingest.py` — chunking, generación de embeddings y persistencia en Chroma.
-- `app/inventory.py` — consultas estructuradas sobre el inventario (búsqueda por producto/categoría, stock bajo mínimo, próximos a vencer).
-- `app/chain.py` — cadena de recuperación + generación (RAG) sobre las políticas, usando Chroma como retriever y Gemma (vía Ollama) como generador.
-- `app/router.py` — dentro del modo inventario, decide qué función de `app/inventory.py` llamar (categoría, stock mínimo, vencimiento o búsqueda por texto) por coincidencia directa contra el propio catálogo.
-- `app/main.py` — API (FastAPI), en producción vía Docker Compose (ver Despliegue).
+| Módulo | Responsabilidad |
+|---|---|
+| `app/loaders.py` | Carga de PDF (`PyPDFLoader`) e inventario (`pandas.read_excel`). |
+| `app/ingest.py` | Chunking, embeddings y persistencia en Chroma. |
+| `app/chain.py` | Cadena RAG sobre las políticas: Chroma como retriever y Gemma (vía Ollama) como generador. |
+| `app/inventory.py` | Consultas estructuradas: búsqueda por producto o categoría, stock bajo mínimo, próximos a vencer. |
+| `app/router.py` | Dentro del modo Inventario, decide qué función de `inventory.py` llamar, por coincidencia contra el propio catálogo. |
+| `app/main.py` | API con FastAPI (uvicorn). |
+| `ui/app.py` | Interfaz en Streamlit ("Centy"): chat, selector de modo y panel lateral de preguntas sugeridas. |
 
 ### Endpoints de la API
 
-| Método | Ruta               | Descripción                                                                 |
-|--------|---------------------|------------------------------------------------------------------------------|
-| GET    | `/health`           | Chequeo de que la API está arriba.                                           |
-| POST   | `/chat/documentos`  | Preguntas sobre políticas y procedimientos. `{"pregunta": str}` → cadena RAG (Chroma + Gemma). |
-| POST   | `/chat/inventario`  | Preguntas sobre el inventario. `{"pregunta": str}` → consulta estructurada con pandas (nunca inventa cifras). |
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/health` | Health check. |
+| POST | `/chat/documentos` | Preguntas sobre políticas y procedimientos. `{"pregunta": str}` → cadena RAG (Chroma + Gemma). |
+| POST | `/chat/inventario` | Preguntas sobre el inventario. `{"pregunta": str}` → consulta estructurada con pandas (nunca inventa cifras). |
 
 Ambos devuelven `{"respuesta": str}`.
 
-### Despliegue (Docker Compose)
-
-4 contenedores en una sola VM (ver [`docker/docker-compose.yml`](docker/docker-compose.yml) y la guía completa en [`docs/deploy.md`](docs/deploy.md)):
-
-- `ollama` — servidor Ollama (LLM + embeddings), modelos persistidos en volumen.
-- `ollama-init` — corre una vez al iniciar, descarga `gemma2:2b` y `bge-m3`, y termina.
-- `app` — API FastAPI (`/chat/documentos`, `/chat/inventario`), con `data/` montado como volumen (PDFs, XLSX y el vector store Chroma).
-- `ui` — interfaz Streamlit, expuesta públicamente en el puerto 8501.
-
-### Decisiones técnicas relevantes
-
-**Modelo de embeddings: `bge-m3` en vez de `nomic-embed-text`.**
-Durante las pruebas locales del Bloque 2, `nomic-embed-text` (el candidato inicial, muy liviano) fallaba en recuperar el contexto correcto para preguntas conversacionales en español. Por ejemplo, ante "Acaba de sonar la alerta sísmica, ¿qué debo hacer ahora?", el retriever traía chunks sobre prevención de pérdidas o seguridad del estacionamiento en vez de la sección 13.3 (Protocolo de Sismo), que sí existe en el documento. Se confirmó con `similarity_search` directo que la búsqueda por palabras clave sueltas ("alerta sísmica sismo") sí encontraba el chunk correcto, pero la frase conversacional completa no — indicando una debilidad semántica del modelo en español, no un problema de chunking. Tras cambiar a `bge-m3` (embeddings multilingües, ~1.2 GB, sigue siendo apto para el límite de 12 GB de OCI), la misma pregunta recuperó el chunk correcto y la cadena completa respondió con precisión. Se repitieron 6 preguntas de prueba (una por cada categoría de ejemplo del proyecto) con resultados correctos.
-
-**Dos endpoints separados (`/chat/documentos` y `/chat/inventario`) en vez de uno con detección automática.**
-La primera versión probada localmente tenía un único endpoint `/chat` que decidía con un router por palabras clave (`stock`, `inventario`, `precio`, etc.) si la pregunta era de inventario o de políticas. Al probarlo a mano, la pregunta "¿En qué pasillo se encuentra ubicado el arroz blanco Verde Valle?" cayó, por descarte, en la cadena RAG de los PDFs y respondió de forma confusa: ni "pasillo" ni "ubicado" estaban en la lista de palabras clave (la columna real se llama "Ubicación" en el XLSX). Cualquier lista de keywords tiene ese mismo punto ciego de forma estructural. Se decidió eliminar la detección automática y separar el modo a nivel de endpoint: la interfaz (Bloque 3) le pedirá al usuario elegir entre "preguntar sobre documentos" o "preguntar sobre inventario" — coherente con el diseño de panel lateral de sugerencias ya definido para la UX. El router por palabras clave se conservó, pero reducido a una tarea más acotada y fiable: una vez que ya se sabe que la pregunta es de inventario, decidir qué función de pandas llamar.
-
-**Chunk size 1200/200, `k=6` y system prompt endurecido, tras probar la interfaz.**
-Al probar la UI de Streamlit del Bloque 3 aparecieron tres respuestas problemáticas en el modo Documentos. Se investigó cada una inspeccionando directamente los chunks recuperados (no solo la respuesta final):
-
-- *"¿Cuál es la clasificación de proveedores?"* omitía la Categoría B: el chunk con su descripción completa existía en el vector store pero rankeaba #9 por similitud, fuera incluso de un `k=8` de prueba — la sección compacta de categorías A/B/C quedaba fragmentada por el `chunk_size` de 800 caracteres.
-- *"Vi a un cliente metiendo productos en su bolsa sin pagar..."* mezclaba el protocolo de robo con el de manejo de producto dañado: el retriever traía un chunk de otro documento (Política de Devoluciones) sin relación con robos, con un score de similitud muy cercano al de los chunks relevantes (sin salto claro que un umbral pudiera filtrar).
-- *"Un empleado ha faltado 3 veces..."* respondía la sanción de Reincidencia en vez de Primera Vez, **a pesar de que el chunk recuperado contenía la tabla completa y correcta** — un problema de lectura del modelo, no de recuperación.
-
-Se aplicaron tres mitigaciones: `CHUNK_SIZE` 800→1200 y `CHUNK_OVERLAP` 150→200 (mantiene juntas secciones/listas compactas como la de categorías de proveedores), `k` del retriever 4→6, y un system prompt más explícito sobre ignorar contexto irrelevante y prestar cuidado a filas/columnas de tablas. Al reingestar y volver a probar las 3 preguntas más las 6 ya validadas del Bloque 2 (sin regresiones), el caso de proveedores y el de robo quedaron corregidos. El caso de las 3 faltas **persiste**: `PyPDFLoader` extrae las tablas del PDF como texto corrido sin estructura de filas/columnas, y un modelo de 2B parámetros tiene dificultad real para asociar correctamente la fila y columna que corresponden — ni el prompt ni más contexto lo resuelven. Se documenta como limitación conocida (ver `docs/bitacora-tecnica.md`) y se retiró esa pregunta del panel de sugerencias del Bloque 3, dejando en su lugar la de "acta administrativa" (misma categoría de Gestión de Personal, validada de forma consistente).
-
-**Se mantiene OCI (1 VM consolidada, Pay-As-You-Go) en vez de migrar a Streamlit Cloud/AWS.**
-A mitad del Bloque 3, la cuenta OCI Free Tier recibió aviso de suspensión de su período de prueba. Se evaluó migrar a Streamlit Community Cloud y/o recursos gratuitos de AWS, pero ambas alternativas resultaron más limitadas de lo esperado para este proyecto: AWS Free Tier ya no ofrece EC2 permanente (solo 12 meses, 1 GB RAM, y solo para cuentas creadas antes de julio de 2025); Streamlit Community Cloud tiene 1 GB RAM y no soporta correr Ollama. Se decidió mantenerse en OCI: consolidar las 2 instancias `VM.Standard.A1.Flex` en 1 sola (2 OCPU/12 GB Always Free) y cambiar la cuenta a Pay-As-You-Go para evitar la suspensión del trial, permaneciendo dentro de los límites Always Free para no generar cargos. La VM corre Oracle Linux 9, lo que suma dos capas de firewall a considerar además de la Security List de OCI: `firewalld` (activo por defecto) y SELinux (requiere la bandera `:z` en el volumen de `data/` montado en Docker — ver `docker/docker-compose.yml`). Detalle completo en `docs/bitacora-tecnica.md` y `docs/deploy.md`.
-
-**Se acepta un tiempo de respuesta de 30-45 segundos a cambio de tener todo dockerizado y autoalojado.**
-Es una decisión consciente, no una limitación pasada por alto: se priorizó que Ollama, la API y la interfaz corran completos en una sola VM propia, sin ninguna llamada a servicios externos, para que los documentos internos de la empresa nunca salgan de la infraestructura controlada por Mercado Central 24h. El costo de esa decisión es velocidad — un modelo de 2B corriendo por CPU en 2 OCPU no es rápido. Con recursos de cómputo de pago en la nube (más OCPU, GPU) o con hardware local más potente, el tiempo de respuesta bajaría de forma significativa manteniendo exactamente la misma arquitectura y el mismo nivel de seguridad de los documentos — es una limitación de recursos del tier gratuito, no del diseño.
-
-**Evaluando reranking con cross-encoder (en curso, aún no en producción).**
-El monitoreo de recursos en el deploy real (ver Evidencia del deploy) mostró que sobra RAM pero el CPU se satura por completo durante la generación. Se probó localmente si un cross-encoder pequeño y multilingüe (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`, ~118 MB, vía `sentence-transformers`) sería viable: recuperar 15 candidatos por similitud, rerankearlos, y quedarse con los 6 mejores antes de generar. El paso de reranking en sí tomó consistentemente entre 0.7 y 0.9 segundos en 4 preguntas de prueba — muy por debajo del margen aceptable (3-5s) — y en 2 de los 4 casos la respuesta con reranking resultó más completa y fiel al documento que la respuesta base. Falta validar que ese mismo tiempo se sostenga en la VM de producción (ARM64, con el CPU ya al límite durante la generación) antes de decidir si se integra de forma permanente. Detalle completo en `docs/bitacora-tecnica.md`.
-
 ## Stack
 
-- **Lenguaje:** Python
+- **Lenguaje:** Python 3.11
 - **Framework del agente:** LangChain
-- **Lectura de documentos:** PyPDF (PDFs) + pandas (inventario XLSX, consulta estructurada)
-- **Embeddings:** bge-m3 (vía Ollama)
+- **Documentos:** PyPDF (PDF) + pandas (XLSX)
+- **Embeddings:** `bge-m3` vía Ollama
 - **Vector store:** Chroma
-- **LLM:** Gemma (vía Ollama), dockerizado
-- **API del agente:** FastAPI + uvicorn
-- **Interfaz UX/UI:** Streamlit ("Centy") — chat con panel lateral de sugerencias
-- **Deploy:** Docker Compose (Ollama + API + UI) en 1 VM Ampere A1 Always Free (OCI, Oracle Linux 9)
+- **LLM:** `gemma2:2b` vía Ollama
+- **API:** FastAPI + uvicorn
+- **UI:** Streamlit
+- **Deploy:** Docker Compose (4 servicios) en 1 VM `VM.Standard.A1.Flex` (2 OCPU / 12 GB, Always Free), Oracle Linux 9, OCI
+
+## Decisiones técnicas
+
+**Embeddings: `bge-m3` en vez de `nomic-embed-text`.**
+`nomic-embed-text` fallaba con preguntas conversacionales en español. Ante "Acaba de sonar la alerta sísmica, ¿qué debo hacer ahora?", el retriever traía chunks de prevención de pérdidas en vez de la sección 13.3 (Protocolo de Sismo). Con `similarity_search` directo se confirmó que las palabras clave sueltas ("alerta sísmica sismo") sí encontraban el chunk correcto y la frase completa no: era una debilidad semántica del modelo en español, no un problema de chunking. Con `bge-m3` (multilingüe, ~1,2 GB, cabe en los 12 GB de la VM) la misma pregunta recuperó el chunk correcto. Se validaron 6 preguntas, una por categoría.
+
+**Dos endpoints (`/chat/documentos` y `/chat/inventario`) en vez de un router por keywords.**
+La primera versión tenía un único `/chat` que decidía por palabras clave (`stock`, `inventario`, `precio`…). "¿En qué pasillo se encuentra ubicado el arroz blanco Verde Valle?" cayó en el RAG de los PDF porque ni "pasillo" ni "ubicado" estaban en la lista (la columna real es "Ubicación"). Toda lista de keywords tiene ese punto ciego. Se eliminó la detección automática: el usuario elige el modo en la UI, y el router quedó acotado a elegir la función de pandas una vez que ya se sabe que la pregunta es de inventario.
+
+**Chunking 1200/200, `k=6` y system prompt endurecido.**
+Al probar la UI aparecieron tres respuestas incorrectas. Cada una se diagnosticó inspeccionando los chunks recuperados, no solo la respuesta final, para separar fallas de *retrieval* de fallas de *generation*:
+- La clasificación de proveedores omitía la Categoría B: su chunk existía, pero rankeaba #9, porque el `chunk_size` de 800 fragmentaba la sección.
+- El protocolo de robo se mezclaba con el de producto dañado: un chunk de otro documento entraba con un score casi igual al de los relevantes (0,84–0,96, sin un salto que un umbral pudiera filtrar).
+- Una sanción se leía de la columna equivocada de una tabla, aunque el chunk recuperado era el correcto.
+
+Mitigaciones: `CHUNK_SIZE` 800 → 1200, `CHUNK_OVERLAP` 150 → 200, `k` 4 → 6 y un prompt que pide ignorar el contexto irrelevante y leer las tablas con cuidado. Resultado: se corrigieron los dos primeros casos, sin regresiones en las 6 preguntas base (302 chunks, antes 433). El tercero persiste (ver Limitaciones).
+
+**Mantenerse en OCI en vez de migrar.**
+A mitad del proyecto, la cuenta Free Tier recibió aviso de fin del periodo de prueba. Se evaluaron alternativas gratuitas: AWS Free Tier (1 GB de RAM y solo 12 meses para cuentas nuevas), Streamlit Community Cloud (1 GB de RAM, no corre Ollama) y Hugging Face Spaces (Docker solo en plan de pago). Se decidió consolidar 2 VMs A1 en 1 (2 OCPU / 12 GB) y pasar la cuenta a Pay-As-You-Go dentro de los límites Always Free.
+
+**Latencia de 30–45 s aceptada a cambio de un stack autoalojado.**
+Ollama, la API y la UI corren en una sola VM, sin llamadas a servicios externos, para que los documentos no salgan de la infraestructura propia. Un modelo de 2B por CPU en 2 OCPU no es rápido: es una restricción de recursos del tier gratuito, no del diseño. Con más OCPU o GPU, la latencia baja sin cambiar la arquitectura.
+
+**Reranking con cross-encoder: experimento local, no integrado.**
+Como `docker stats` mostró RAM de sobra y CPU saturado, se probó en local `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (~118 MB): recuperar 15 candidatos, rerankear y quedarse con 6. El paso de reranking tomó 0,7–0,9 s en 4 preguntas (umbral aceptable: 3–5 s), y en 2 de 4 la respuesta fue más completa y fiel al documento. **La validación en la VM ARM64 no alcanzó a hacerse antes de cerrar el deploy**, así que no se integró.
+
+## Limitaciones conocidas
+
+- **Tablas en PDF:** `PyPDFLoader` las extrae como texto corrido, sin filas ni columnas, y un modelo de 2B confunde columnas parecidas ("Primera vez" vs. "Reincidencia"). Esa pregunta se retiró de las sugerencias de la UI. Trabajo futuro: extraer tablas con `pdfplumber` o `unstructured` durante la ingesta.
+- **Latencia de 30–45 s** por la decisión de autoalojar en CPU (ver arriba).
+- **Evaluación acotada:** un set manual de 6 preguntas de regresión más 3 casos de error, sin métricas automáticas de retrieval.
 
 ## Ejemplos de preguntas y respuestas
 
-Validado localmente contra `/chat/documentos` (gemma2:2b + bge-m3 + Chroma):
+Validados en local contra `/chat/documentos` (`gemma2:2b` + `bge-m3` + Chroma):
 
 > **P:** ¿A qué hora debe estar terminado el surtido nocturno?
 > **R:** El surtido nocturno debe completarse antes de las 05:30 hrs para dar tiempo a la revisión de apertura del turno matutino.
@@ -101,25 +107,22 @@ Validado localmente contra `/chat/documentos` (gemma2:2b + bge-m3 + Chroma):
 > **P:** Acaba de sonar la alerta sísmica, ¿qué debo hacer ahora?
 > **R:** Al sonar la Alerta Sísmica de la CDMX, debes seguir estos pasos: evacuar a los clientes a las zonas de menor riesgo señalizadas, permanecer alejado de ventanas y estantes de producto pesado, y no correr hacia las salidas durante el movimiento — esperar a que el sismo termine.
 
-> **P:** ¿Cuál es el proceso para levantar un acta administrativa?
-> **R:** El Supervisor de Área o Jefe de Turno detecta y documenta la falta, se notifica a Recursos Humanos, se cita al colaborador a una entrevista formal donde puede exponer su versión y presentar evidencia, y se elabora el acta (si se niega a firmar, se hace constar ante dos testigos y conserva plena validez).
-
 > **P:** ¿Cuál es la clasificación de proveedores?
 > **R:** Categoría A (Estratégicos, alto volumen y relación de largo plazo), Categoría B (Importantes, volumen medio y productos diferenciados) y Categoría C (Complementarios, menor impacto en el volumen total).
 
-> **P:** ¿Cuál es la capital de Francia? *(pregunta fuera de alcance)*
+> **P:** ¿Cuál es la capital de Francia? *(fuera de alcance)*
 > **R:** Lo siento, pero mi conocimiento se basa en los documentos proporcionados. No tengo información sobre la capital de Francia. Te recomiendo consultar una fuente confiable.
 
-Validado localmente contra `/chat/inventario` (consulta estructurada, sin LLM):
+Validado en local contra `/chat/inventario` (sin LLM):
 
 > **P:** ¿En qué pasillo se encuentra ubicado el arroz blanco Verde Valle?
 > **R:** SKU: MER-001, Descripción: Arroz Blanco Tipo 1 5kg, Categoría: Abarrotes, Ubicación: Pasillo 1, Stock Actual: 150, Stock Mínimo: 50, Precio de Venta Unitario: 25.9
 
-## Cómo ejecutar el proyecto
+## Cómo ejecutarlo
 
 ### Local (desarrollo)
 
-Requiere Python 3.11 (entorno conda/venv propio) y [Ollama](https://ollama.com) instalado, con los modelos descargados:
+Requiere Python 3.11 y [Ollama](https://ollama.com) con los modelos descargados:
 
 ```bash
 ollama pull gemma2:2b
@@ -127,20 +130,22 @@ ollama pull bge-m3
 pip install -r requirements.txt
 cp .env.example .env
 
-python -m app.ingest          # construye el vector store (una vez, o cuando cambien los PDFs)
+python -m app.ingest          # construye el vector store (una vez, o cuando cambien los PDF)
 
 # Terminal 1 — API
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# Terminal 2 — interfaz
+# Terminal 2 — UI
 streamlit run ui/app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 Abrir `http://127.0.0.1:8501`.
 
-### En la nube (OCI, producción)
+> Los PDF y el XLSX no se versionan (`.gitignore`): hay que copiarlos en `data/pdfs/` y `data/inventario/`.
 
-Todo el stack (Ollama + API + interfaz) corre dockerizado en una sola VM Ampere A1 Always Free. Ver la guía completa, con todos los comandos, en [`docs/deploy.md`](docs/deploy.md):
+### En la nube (OCI)
+
+Guía completa en [`docs/deploy.md`](docs/deploy.md). En resumen:
 
 ```bash
 cd docker
@@ -148,21 +153,39 @@ docker compose up -d --build
 docker compose exec app python -m app.ingest
 ```
 
+Servicios de [`docker/docker-compose.yml`](docker/docker-compose.yml):
+- `ollama`: servidor de LLM y embeddings, con los modelos en un volumen.
+- `ollama-init`: corre una vez, descarga `gemma2:2b` y `bge-m3`, y termina.
+- `app`: API FastAPI, con `data/` montado como volumen (`:z` por SELinux).
+- `ui`: Streamlit en el puerto 8501.
+
 ## Evidencia del deploy
 
-> ### 🔗 Aplicación en producción: **http://158.247.123.37:8501**
+Deploy en una VM `VM.Standard.A1.Flex` (2 OCPU / 12 GB, Always Free, ARM64) con Oracle Linux 9, **activo de julio al 30 de agosto de 2026**. Hoy no hay demo en línea.
 
-Desplegada de punta a punta en una VM `VM.Standard.A1.Flex` (2 OCPU / 12 GB, Always Free), Oracle Linux 9, siguiendo la guía de [`docs/deploy.md`](docs/deploy.md).
-
-**Checklist verificado:**
-- [x] Docker + Compose instalados en la VM (`dnf`, ver `docs/deploy.md`).
-- [x] `docker compose up -d --build` — 4 servicios arriba (`ollama`, `ollama-init`, `app`, `ui`).
-- [x] Ingesta ejecutada en la VM: **302 chunks**, idéntico al conteo en local — confirma que los PDFs subidos vía Object Storage llegaron completos.
+**Checklist verificado durante el deploy:**
+- [x] Docker 29.6.2 y Compose v5.3.1 instalados con `dnf`.
+- [x] `docker compose up -d --build`: 4 servicios arriba (build de imágenes en la propia VM ARM64).
+- [x] Ingesta en la VM: **302 chunks**, igual que en local; confirma que los PDF llegaron completos.
 - [x] Acceso público verificado desde el navegador.
 
-**Troubleshooting real durante el despliegue** (detalle completo en `docs/bitacora-tecnica.md`):
-- La app respondía bien probada desde dentro de la VM (`curl localhost:8501` → 200 OK) pero no era accesible desde internet. `firewalld` ya tenía el puerto abierto — la causa real fue la capa de red de OCI (Network Security Group / Security List), que necesita su propia regla de ingreso independiente de `firewalld`. Son dos capas de firewall distintas y ambas deben estar abiertas.
+**Transferencia de archivos sin `scp`:** los PDF y el XLSX se subieron a Object Storage y se descargaron en la VM con Pre-Authenticated Requests (`wget`) desde OCI Cloud Shell.
 
-**Monitoreo de recursos** (`docker stats`, `free -h`):
-- En reposo: `ollama` usa solo 88.7 MiB (sin modelos cargados en memoria); 9.3 GB de 10 GB disponibles; swap sin usar.
-- En el pico de una consulta activa: `ollama` sube a **~198% de CPU** (los 2 OCPU casi al 100% cada uno) y **~3.86 GB de RAM**. Esto confirma que **el CPU, no la RAM, es el recurso limitante** en esta VM — quedan ~5-6 GB de RAM libres incluso en el pico, lo que abre la puerta a evaluar el reranking con cross-encoder (ver Decisiones técnicas).
+**Troubleshooting de red (diagnóstico de adentro hacia afuera):**
+1. `docker compose ps`: contenedores `Up` y puerto `8501` publicado.
+2. `curl -I http://localhost:8501` desde la VM: `200 OK`. La app funcionaba.
+3. `docker compose logs ui`: Streamlit detectaba bien su URL externa.
+4. `firewall-cmd --list-ports`: `8501/tcp` abierto.
+5. Causa: faltaba la regla de ingreso en la **Security List de la VCN**, una capa independiente de `firewalld`. Un timeout (y no un "connection refused") apunta a la red de la nube, no al sistema operativo.
+
+**Monitoreo de recursos** (`docker stats --no-stream`, `free -h`):
+
+| Contenedor | Reposo: CPU / RAM | Pico (respondiendo): CPU / RAM |
+|---|---|---|
+| `ollama` | 0,00 % / 88,7 MiB | **~198 % / ~3,86 GiB** |
+| `app` | 0,07 % / 136,5 MiB | 0,10 % / 137 MiB |
+| `ui` | 0,22 % / 53,5 MiB | ~0,3 % / 54 MiB |
+
+Conclusión: en 2 OCPU, **el CPU limita la generación, no la RAM** (quedan ~5–6 GiB libres en el pico). Cualquier paso extra de cómputo, como un reranker, se suma en serie a la latencia.
+
+Detalle completo, con cada hallazgo y decisión: [`docs/bitacora-tecnica.md`](docs/bitacora-tecnica.md).
