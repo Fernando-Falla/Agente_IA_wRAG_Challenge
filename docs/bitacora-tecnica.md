@@ -162,3 +162,36 @@ Como beneficio adicional no buscado: en 2 de las 4 preguntas (robo, sismo), la r
 ## Cierre del deploy
 
 El deploy en OCI estuvo activo desde julio hasta el **30 de agosto de 2026**. Después se canceló la cuenta de OCI y la aplicación quedó fuera de línea. Por eso **la prueba del reranker en la VM no se llegó a hacer** y el reranker no se integró al pipeline. La evidencia del deploy es la que queda en esta bitácora (instalación, ingesta de 302 chunks, troubleshooting de red y monitoreo con `docker stats`) y en el README.
+
+---
+
+## Bloque 5 — Reranker integrado y medido en local (noviembre de 2026)
+
+**Contexto:** el proyecto se retomó en otro equipo (portátil), con Ollama y los modelos instalados de nuevo. Todo lo de este bloque es local; el reranker nunca corrió en OCI.
+
+**Por qué un cross-encoder con `sentence-transformers`:** reordena en memoria los candidatos que ya devuelve Chroma, sin tocar el índice. Se consideró ColBERT (late interaction), pero no se probó: exigiría reemplazar ChromaDB por un índice por token y probablemente no cabría en una VM Always Free.
+
+**Implementación:**
+- `app/reranker.py`: `rerank_documents(query, documents, top_k)` con carga perezosa del modelo `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (~118 MB, multilingüe).
+- `app/chain.py`: `ENABLE_RERANKER` (por defecto `false`), `RERANKER_INITIAL_K=15` y `RERANKER_TOP_K=6`.
+- `sentence-transformers` (y con él PyTorch) va en `requirements-reranker.txt`, para que la imagen base no cargue con él cuando está desactivado.
+
+**Benchmark (`scripts/benchmark_reranker.py`; 7 preguntas, una sola corrida):**
+
+| Pregunta | Paso de reranking (15 → 6) | Fragmentos cambiados en el top 6 |
+|---|---|---|
+| robo | 15,38 s (incluye la carga del modelo) | 2 |
+| sismo | 2,83 s | 1 |
+| proveedores | 2,43 s | 2 |
+| surtido | 2,30 s | 2 |
+| peps | 2,37 s | 3 |
+| acta | 3,26 s | 2 |
+| faltas | 3,03 s | 3 |
+
+- Paso de reranking en caliente: 2,3–3,3 s (~2,7 s de media); 15 fragmentos cambiados en total.
+- Los tiempos de generación de Gemma variaron mucho entre corridas (como ya se vio en julio) y no se usan para sacar conclusiones.
+- **Hallazgo:** en *"Vi a un cliente metiendo productos en su bolsa sin pagar. ¿Cuál es el protocolo?"*, abrir el pool a 15 candidatos trajo un fragmento de la Política de Atención al Cliente sobre retiro de producto dañado. El cross-encoder le dio el score más alto (−1,08) y bajó el protocolo de robo al 4.º puesto (−2,63). Con ese contexto, `gemma2:2b` respondió con el procedimiento de producto dañado ("aislar el producto en cuarentena"). Sin reranker (`k=6`), la respuesta fue correcta.
+
+**Diferencia con julio, pendiente de explicar:** en julio el paso de reranking tomó 0,7–0,9 s y en la pregunta de robo la respuesta mejoró; ahora toma ~2,7 s y la pregunta de robo (redactada de otra forma) empeora. Cambiaron el equipo y la instalación; falta repetir la prueba en las mismas condiciones.
+
+**Decisión:** el reranker queda integrado pero desactivado por defecto (`ENABLE_RERANKER=false`). Solo conviene activarlo con un filtro previo por documento o metadatos que impida mezclar manuales con vocabulario parecido.
