@@ -2,6 +2,13 @@
 
 Agente de IA que responde preguntas en lenguaje natural sobre los documentos internos de una empresa (PDF) y sobre su inventario (XLSX), sin abrir los archivos a mano.
 
+> **El caso en 30 segundos**
+> - **Problema:** responder preguntas sobre políticas internas (PDF) y sobre inventario (XLSX) sin que un LLM pequeño invente cifras.
+> - **Decisión:** arquitectura híbrida: RAG para los PDF y consultas deterministas con pandas para el inventario, todo autoalojado (Ollama y Docker Compose) en una VM Always Free de OCI.
+> - **Resultado medido:** recuperación corregida a partir de diagnósticos (bge-m3, chunking 1200/200, k=6), sin regresiones en 6 preguntas de validación. Desplegado en OCI (jul – 30-ago-2026) con perfil de recursos: el CPU limita (~198 %), no la RAM (~3,86 GB). El reranker cross-encoder se implementó y se dejó desactivado tras medirlo: sumaba ~2,7 s y en una pregunta desplazó el procedimiento correcto.
+>
+> **In English:** Hybrid RAG agent for internal documents. Policy PDFs are answered with RAG; inventory questions run deterministic pandas queries, so a 2B model never makes up stock figures. Self-hosted with Ollama and Docker Compose on an OCI Always Free VM (deployed Jul – Aug 30, 2026). Retrieval fixes came from diagnosis and were checked against a 6-question regression set. A cross-encoder reranker was built and left off by default: it added ~2.7 s per query and, in one case, pushed the correct procedure down.
+
 > **Contexto:** challenge académico. La empresa ("Mercado Central 24h"), sus PDF y su inventario son **material ficticio**.
 >
 > **Estado:** **desplegado en OCI (jul – 30-ago-2026)** en una VM Ampere A1 Always Free con Docker Compose. Hoy no hay demo en línea: la cuenta de OCI se cerró. La evidencia del deploy (ingesta, troubleshooting y monitoreo de recursos) está en [Evidencia del deploy](#evidencia-del-deploy) y en [`docs/bitacora-tecnica.md`](docs/bitacora-tecnica.md).
@@ -15,6 +22,18 @@ Agente de IA que responde preguntas en lenguaje natural sobre los documentos int
 - **Deploy autoalojado de punta a punta:** 4 servicios en Docker Compose sobre Oracle Linux 9 (ARM64), con troubleshooting real de red (Security List de OCI + `firewalld`) y SELinux.
 - **Profiling antes de optimizar:** `docker stats` mostró que el cuello de botella es el CPU, no la RAM; eso orientó la evaluación de un reranker.
 - **Limitaciones documentadas con su causa raíz** (ver [Limitaciones conocidas](#limitaciones-conocidas)).
+
+## Capturas
+
+Ejecución en local, 22-nov-2026 (el deploy en OCI terminó el 30-ago-2026). Inventario y PDF son material ficticio del challenge.
+
+**Modo Inventario:** la respuesta sale de pandas, sin pasar por el LLM.
+
+![Modo Inventario: ubicación, stock y precio de los productos de arroz](docs/img/captura-inventario.jpg)
+
+**Modo Documentos:** RAG sobre el protocolo de sismo.
+
+![Modo Documentos: respuesta sobre el protocolo de sismo](docs/img/captura-documentos.jpg)
 
 ## Arquitectura
 
