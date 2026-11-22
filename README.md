@@ -167,7 +167,7 @@ streamlit run ui/app.py --server.address 127.0.0.1 --server.port 8501
 
 Abrir `http://127.0.0.1:8501`.
 
-> Los PDF y el XLSX no se versionan (`.gitignore`): hay que copiarlos en `data/pdfs/` y `data/inventario/`.
+> Los PDF y el inventario XLSX están en `data/pdfs/` y `data/inventario/`: son material ficticio del challenge, provisto por Alura Latam y Oracle Next Education (ver [`data/README.md`](data/README.md)).
 
 ### En la nube (OCI)
 
