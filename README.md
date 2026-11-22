@@ -5,6 +5,8 @@ Agente de IA que responde preguntas en lenguaje natural sobre los documentos int
 > **Contexto:** challenge académico. La empresa ("Mercado Central 24h"), sus PDF y su inventario son **material ficticio**.
 >
 > **Estado:** **desplegado en OCI (jul – 30-ago-2026)** en una VM Ampere A1 Always Free con Docker Compose. Hoy no hay demo en línea: la cuenta de OCI se cerró. La evidencia del deploy (ingesta, troubleshooting y monitoreo de recursos) está en [Evidencia del deploy](#evidencia-del-deploy) y en [`docs/bitacora-tecnica.md`](docs/bitacora-tecnica.md).
+>
+> **Cómo se desarrolló:** con Claude Code y Antigravity. Yo definí el alcance, hice los diagnósticos y tomé las decisiones que documentan este README y la bitácora; el código lo generaron agentes de IA bajo mi orientación.
 
 ## Qué demuestra este proyecto
 
@@ -38,7 +40,8 @@ Pregunta (modo Inventario) ──► router por función ──► pandas sobre 
 |---|---|
 | `app/loaders.py` | Carga de PDF (`PyPDFLoader`) e inventario (`pandas.read_excel`). |
 | `app/ingest.py` | Chunking, embeddings y persistencia en Chroma. |
-| `app/chain.py` | Cadena RAG sobre las políticas: Chroma como retriever y Gemma (vía Ollama) como generador. |
+| `app/chain.py` | Cadena RAG sobre las políticas: Chroma como retriever, reranker opcional y Gemma (vía Ollama) como generador. |
+| `app/reranker.py` | Reordenamiento de 2da etapa (Cross-Encoder `mmarco-mMiniLMv2-L12-H384-v1`), configurable con `ENABLE_RERANKER`. |
 | `app/inventory.py` | Consultas estructuradas: búsqueda por producto o categoría, stock bajo mínimo, próximos a vencer. |
 | `app/router.py` | Dentro del modo Inventario, decide qué función de `inventory.py` llamar, por coincidencia contra el propio catálogo. |
 | `app/main.py` | API con FastAPI (uvicorn). |
@@ -88,14 +91,18 @@ A mitad del proyecto, la cuenta Free Tier recibió aviso de fin del periodo de p
 **Latencia de 30–45 s aceptada a cambio de un stack autoalojado.**
 Ollama, la API y la UI corren en una sola VM, sin llamadas a servicios externos, para que los documentos no salgan de la infraestructura propia. Un modelo de 2B por CPU en 2 OCPU no es rápido: es una restricción de recursos del tier gratuito, no del diseño. Con más OCPU o GPU, la latencia baja sin cambiar la arquitectura.
 
-**Reranking con cross-encoder: experimento local, no integrado.**
-Como `docker stats` mostró RAM de sobra y CPU saturado, se probó en local `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (~118 MB): recuperar 15 candidatos, rerankear y quedarse con 6. El paso de reranking tomó 0,7–0,9 s en 4 preguntas (umbral aceptable: 3–5 s), y en 2 de 4 la respuesta fue más completa y fiel al documento. **La validación en la VM ARM64 no alcanzó a hacerse antes de cerrar el deploy**, así que no se integró.
+**Reranking con cross-encoder: implementado y desactivado por defecto tras medirlo.**
+Modelo: `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (~118 MB, multilingüe). Se recuperan 15 candidatos, se reordenan y se pasan 6 al LLM. Nunca corrió en OCI: todas las pruebas son locales.
+- **Jul 2026, prueba exploratoria** (antes de cerrar el deploy): el paso de reranking tomó 0,7–0,9 s en 4 preguntas y en 2 de ellas la respuesta fue más completa. No se alcanzó a validar en la VM ARM64.
+- **Nov 2026, integración y benchmark** (`app/reranker.py`, `scripts/benchmark_reranker.py`; 7 preguntas, una corrida, en otro equipo): el paso de reranking tomó 2,3–3,3 s en caliente (~2,7 s de media) y cambió 15 fragmentos del top 6. En la pregunta *"Vi a un cliente metiendo productos en su bolsa sin pagar. ¿Cuál es el protocolo?"*, el cross-encoder puso primero un fragmento del protocolo de retiro de producto dañado (score −1,08) y bajó el de robo al 4.º puesto (−2,63); con ese contexto, Gemma respondió con el procedimiento equivocado. Sin reranker, la respuesta fue correcta.
+- **Decisión:** queda desactivado por defecto (`ENABLE_RERANKER=false`). Solo conviene activarlo con un filtro previo por documento o metadatos que impida mezclar manuales con vocabulario parecido. La diferencia de latencia entre julio y noviembre (equipos y condiciones distintos) está pendiente de explicar.
+- **Para activarlo:** `pip install -r requirements-reranker.txt` (instala PyTorch; por eso no está en `requirements.txt`) y `ENABLE_RERANKER=true` en `.env`.
 
 ## Limitaciones conocidas
 
 - **Tablas en PDF:** `PyPDFLoader` las extrae como texto corrido, sin filas ni columnas, y un modelo de 2B confunde columnas parecidas ("Primera vez" vs. "Reincidencia"). Esa pregunta se retiró de las sugerencias de la UI. Trabajo futuro: extraer tablas con `pdfplumber` o `unstructured` durante la ingesta.
 - **Latencia de 30–45 s** por la decisión de autoalojar en CPU (ver arriba).
-- **Evaluación acotada:** un set manual de 6 preguntas de regresión más 3 casos de error, sin métricas automáticas de retrieval.
+- **Evaluación acotada:** un set manual de 6 preguntas de regresión más 3 casos de error, sin métricas automáticas de retrieval. El benchmark del reranker es de una sola corrida.
 
 ## Ejemplos de preguntas y respuestas
 
