@@ -1,0 +1,3 @@
+# Dependencias opcionales del reranker (ENABLE_RERANKER=true). Instala PyTorch.
+-r requirements.txt
+sentence-transformers
