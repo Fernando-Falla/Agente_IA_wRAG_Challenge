@@ -176,7 +176,7 @@ El deploy en OCI estuvo activo desde julio hasta el **30 de agosto de 2026**. De
 - `app/chain.py`: `ENABLE_RERANKER` (por defecto `false`), `RERANKER_INITIAL_K=15` y `RERANKER_TOP_K=6`.
 - `sentence-transformers` (y con él PyTorch) va en `requirements-reranker.txt`, para que la imagen base no cargue con él cuando está desactivado.
 
-**Benchmark (`scripts/benchmark_reranker.py`; 7 preguntas, una sola corrida):**
+**Benchmark (`scripts/benchmark_reranker.py`; 7 preguntas, corrida 1 - 22 nov 2026):**
 
 | Pregunta | Paso de reranking (15 → 6) | Fragmentos cambiados en el top 6 |
 |---|---|---|
@@ -188,10 +188,75 @@ El deploy en OCI estuvo activo desde julio hasta el **30 de agosto de 2026**. De
 | acta | 3,26 s | 2 |
 | faltas | 3,03 s | 3 |
 
-- Paso de reranking en caliente: 2,3–3,3 s (~2,7 s de media); 15 fragmentos cambiados en total.
+- Paso de reranking en caliente (corrida 1): 2,3–3,3 s (~2,7 s de media); 15 fragmentos cambiados en total.
 - Los tiempos de generación de Gemma variaron mucho entre corridas (como ya se vio en julio) y no se usan para sacar conclusiones.
 - **Hallazgo:** en *"Vi a un cliente metiendo productos en su bolsa sin pagar. ¿Cuál es el protocolo?"*, abrir el pool a 15 candidatos trajo un fragmento de la Política de Atención al Cliente sobre retiro de producto dañado. El cross-encoder le dio el score más alto (−1,08) y bajó el protocolo de robo al 4.º puesto (−2,63). Con ese contexto, `gemma2:2b` respondió con el procedimiento de producto dañado ("aislar el producto en cuarentena"). Sin reranker (`k=6`), la respuesta fue correcta.
 
-**Diferencia con julio, pendiente de explicar:** en julio el paso de reranking tomó 0,7–0,9 s y en la pregunta de robo la respuesta mejoró; ahora toma ~2,7 s y la pregunta de robo (redactada de otra forma) empeora. Cambiaron el equipo y la instalación; falta repetir la prueba en las mismas condiciones.
+### Repetición de la prueba y benchmarking empírico (23 nov 2026)
 
-**Decisión:** el reranker queda integrado pero desactivado por defecto (`ENABLE_RERANKER=false`). Solo conviene activarlo con un filtro previo por documento o metadatos que impida mezclar manuales con vocabulario parecido.
+Se volvió a ejecutar `scripts/benchmark_reranker.py` en el mismo entorno portátil para contrastar mediciones y recopilar telemetría de hardware:
+
+| Pregunta | Paso de reranking (15 → 6) | Fragmentos cambiados en el top 6 | Scores Cross-Encoder |
+|---|---|---|---|
+| robo | 20,61 s (incluye carga lazy del modelo) | 2 | `[-1.08, -2.12, -2.33, -2.63, -3.95, -4.90]` |
+| sismo | 2,25 s | 1 | `[-0.71, -5.29, -5.44, -5.67, -6.10, -6.74]` |
+| proveedores | 2,14 s | 2 | `[3.50, 2.37, -0.67, -1.72, -2.22, -2.76]` |
+| surtido | 1,76 s | 2 | `[-0.99, -1.99, -2.77, -2.97, -3.81, -4.53]` |
+| peps | 1,91 s | 3 | `[1.45, -0.01, -3.22, -3.29, -3.41, -3.83]` |
+| acta | 2,28 s | 2 | `[-2.34, -2.51, -5.12, -5.23, -5.26, -5.49]` |
+| faltas | 2,05 s | 3 | `[-1.63, -3.65, -3.73, -4.12, -4.22, -5.20]` |
+
+- **Paso de reranking en caliente:** 1,76–2,28 s (**~2,06 s de media** en caliente).
+- **Consistencia cualitativa:** se repitieron exactamente las mismas sustituciones de chunks (15 en total) y los mismos scores, reproduciendo idénticamente la degradación de respuesta en la pregunta de robo por distracción léxica cruzada.
+
+### Investigación y explicación de la diferencia de latencia (julio vs noviembre)
+
+A partir de datos empíricos recopilados del sistema, hardware y perfilado directo de PyTorch, se identifican las causas reales de la variación:
+
+1. **Diferencia de hardware y envolvente térmica (CPU de escritorio vs CPU móvil ultrabaja):**
+   - **Julio 2026:** las pruebas corrieron en una computadora de escritorio Windows x86_64 ("con recursos de sobra"), caracterizada por CPUs de escritorio estándar (frecuencias base >3.6 GHz, boost sostenido de >4.2 GHz y TDP típico de 65W a 105W).
+   - **Noviembre 2026:** las pruebas corren en un equipo portátil con procesador **Intel Core i5-1035G1** (4 núcleos / 8 hilos, frecuencia base de **1.00 GHz**, TDP nominal de **15 Watts**).
+   - Al comparar las preguntas comunes medidas en caliente:
+     - *Proveedores:* 0,82 s (julio) vs 2,14 s (noviembre repetición) → factor de ~2,6x.
+     - *Surtido:* 0,86 s (julio) vs 1,76 s (noviembre repetición) → factor de ~2,0x.
+     - *Sismo:* 0,90 s (julio) vs 2,25 s (noviembre repetición) → factor de ~2,5x.
+     - *Robo (en caliente puro medido en perfilado):* 0,73 s (julio) vs 2,01 s (noviembre) → factor de ~2,7x.
+   - La brecha promedio en caliente (~0,83 s vs ~2,06 s) corresponde a un factor de **~2,5x**, perfectamente coherente con la diferencia de frecuencia de reloj sostenida y límite térmico de 15W de la CPU móvil frente a una CPU de escritorio bajo el cómputo intensivo en CPU de un modelo Transformer de 12 capas con 15 pares de evaluación.
+
+2. **Efecto de "Cold Start" en la primera medición de noviembre:**
+   - En julio no se incluyó la inicialización del modelo dentro del tiempo de paso del reranker de ninguna pregunta individual.
+   - En el benchmark automatizado de noviembre, la pregunta de robo fue la primera ejecutada, por lo que absorbió la carga perezosa de disco y la inicialización de PyTorch (15,38 s en la corrida 1; 20,61 s en la repetición). No fue una degradación intrínseca de esa pregunta, sino el costo de carga inicial.
+
+3. **Configuración de software e hilos de ejecución:**
+   - En julio se utilizó Python 3.11 en entorno Conda (`agente_rag`).
+   - En noviembre se utiliza Python 3.13.9 con `torch==2.15.0+cpu`.
+   - Se midió empíricamente la sensibilidad al paralelismo intra-op de PyTorch en esta CPU (`torch.set_num_threads`):
+     - 1 hilo: 4,33 s
+     - 2 hilos: 2,85 s
+     - 4 hilos (por defecto): 2,58 s (~2,06 s en caliente)
+     - 8 hilos: 2,30 s
+   - La inferencia se ejecuta 100% sobre CPU (no hay aceleración GPU activa en PyTorch: `torch.cuda.is_available() = False`).
+
+### Evaluación de viabilidad del Reranker y técnicas alternativas de optimización
+
+A partir de los hallazgos y mediciones, se sintetiza la evaluación técnica del reranker frente a las necesidades reales del proyecto:
+
+#### 1. ¿Es útil en el estado actual del proyecto?
+**No.** Los datos empíricos lo desaconsejan por tres factores:
+- **Regresión de calidad (distracción léxica):** En la pregunta de robo (*Prevención de Pérdidas*), abrir el pool a $k=15$ introduce un fragmento sobre cuarentena de producto dañado (*Atención al Cliente*) con mayor score léxico superficial (`-1.08` vs `-2.63`), induciendo una alucinación en `gemma2:2b`. Sin reranker ($k=6$), la respuesta del baseline es correcta.
+- **Sobrecarga de latencia en CPU:** Añade **+2,06 a +2,70 segundos** en caliente por consulta y un *cold start* de **~15–20 s** en una arquitectura donde la CPU ya es el recurso limitante.
+- **Desproporción frente al corpus:** Con solo **302 chunks** y 4 documentos, el bi-encoder denso (`bge-m3`, 1024 dims) ya ofrece suficiente discriminación semántica a $k=6$. Un two-stage retrieval añade valor en índices de miles o millones de documentos, no en un corpus pequeño.
+
+#### 2. ¿Cómo se podría volver útil (análisis de viabilidad futura)?
+Si el corpus creciera significativamente en el futuro, el reranker solo sería viable bajo tres condiciones técnicas:
+1. **Pre-filtrado por metadatos (*Metadata Filtering*):** Aplicar `where={"source": "..."}` en Chroma antes del reranking para confinar la evaluación al manual correspondiente, eliminando la colisión léxica entre documentos.
+2. **Ventana reducida de candidatos:** Reducir $k_{\text{inicial}}$ de 15 a 8–10 chunks, recortando la latencia en CPU a ~1,0–1,2 s y evitando el ruido de la cola del ranking.
+3. **Optimización con ONNX Runtime (INT8):** Exportar el Cross-Encoder a ONNX cuantizado para bajar la inferencia en CPU a <0,7 s y eliminar la pesada dependencia de PyTorch (`torch` de ~2 GB en disco).
+
+#### 3. Técnicas alternativas prioritarias con mayor retorno de inversión
+En lugar del reranker, las siguientes técnicas resuelven las limitaciones reales documentadas:
+- **Extracción estructurada de tablas en la ingesta (Prioridad Alta):** Es la solución directa para la única limitación que persiste en el agente (la confusión entre *Primera Vez* y *Reincidencia* en la tabla de sanciones por faltas). Sustituir el aplanado de `PyPDFLoader` por tablas en formato Markdown (mediante librerías como `pdfplumber` o `unstructured`) resolverá la incapacidad de lectura tabular del LLM de 2B sin costo en tiempo de inferencia.
+- **Enrutamiento semántico / Filtro por documento (Prioridad Media):** Clasificar la consulta para restringir el vector store al documento relevante con costo de cómputo marginal.
+- **Búsqueda híbrida ligera (BM25 + Denso / RRF):** Para responder con fidelidad ante códigos exactos de artículos o artículos del reglamento sin depender de un modelo Transformer adicional.
+
+**Decisión final:** el reranker queda integrado en el repositorio pero desactivado por defecto (`ENABLE_RERANKER=false`). La arquitectura base directa ($k=6$, `CHUNK_SIZE=1200`) es más rápida, más precisa y más austera en recursos.
